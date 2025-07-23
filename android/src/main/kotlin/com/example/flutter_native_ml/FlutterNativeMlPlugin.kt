@@ -1,17 +1,18 @@
-package com.example.flutter_native_ml
+package com.example.flutter_native_ml;
 
-import androidx.annotation.NonNull
-import io.flutter.embedding.engine.plugins.FlutterPlugin
-import io.flutter.plugin.common.MethodCall
-import io.flutter.plugin.common.MethodChannel
-import org.tensorflow.lite.DataType
-import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.nnapi.NnApiDelegate
-import java.io.FileInputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.nio.channels.FileChannel
-import java.util.UUID
+import androidx.annotation.NonNull;
+import io.flutter.embedding.engine.plugins.FlutterPlugin;
+import io.flutter.plugin.common.MethodCall;
+import io.flutter.plugin.common.MethodChannel;
+import com.google.ai.edge.litert.DataType;
+import com.google.ai.edge.litert.Interpreter;
+import com.google.ai.edge.litert.gpu.CompatibilityList;
+import com.google.ai.edge.litert.gpu.GpuDelegate;
+import java.io.FileInputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
+import java.util.UUID;
 
 class FlutterNativeMlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private lateinit var channel: MethodChannel
@@ -20,7 +21,7 @@ class FlutterNativeMlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     data class ModelHolder(
         val interpreter: Interpreter,
-        val nnApiDelegate: NnApiDelegate?
+        val gpuDelegate: GpuDelegate?
     )
 
     override fun onAttachedToEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
@@ -54,15 +55,19 @@ class FlutterNativeMlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         val buffer = inputStream.channel.map(FileChannel.MapMode.READ_ONLY, afd.startOffset, afd.declaredLength)
 
         val options = Interpreter.Options()
-        var nnDelegate: NnApiDelegate? = null
-        if (computeUnits == "all") {
-            nnDelegate = NnApiDelegate()
-            options.addDelegate(nnDelegate)
+        var gpuDelegate: GpuDelegate? = null
+        val compatList = CompatibilityList()
+        if (computeUnits == "all" && compatList.isDelegateSupportedOnThisDevice) {
+            val delegateOptions = compatList.bestOptionsForThisDevice
+            gpuDelegate = GpuDelegate(delegateOptions)
+            options.addDelegate(gpuDelegate)
+        } else {
+            options.setNumThreads(4)  // Fallback to multi-threaded CPU
         }
 
         val interpreter = Interpreter(buffer, options)
         val modelId = UUID.randomUUID().toString()
-        loadedModels[modelId] = ModelHolder(interpreter, nnDelegate)
+        loadedModels[modelId] = ModelHolder(interpreter, gpuDelegate)
         result.success(modelId)
     }
 
@@ -111,12 +116,17 @@ class FlutterNativeMlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             val idx = nameToIdx[name]
                 ?: return result.error("INPUT_MISMATCH", "No input named '$name'", null)
             val t = interpreter.getInputTensor(idx)
-            val arr = (raw as List<Number>).map { it.toFloat() }.toFloatArray()
+            val type = t.dataType()
+            val list = (raw as List<Number>)
             val expectedSize = t.shape().reduce { a, b -> a * b }
-            if (arr.size != expectedSize) {
+            if (list.size != expectedSize) {
                 return result.error("SHAPE_MISMATCH", "$name expects $expectedSize elements", null)
             }
-            inputs[idx] = arr
+            inputs[idx] = when (type) {
+                DataType.FLOAT32 -> list.map { it.toFloat() }.toFloatArray()
+                DataType.UINT8, DataType.INT8 -> ByteArray(list.size) { list[it].toByte() }
+                else -> return result.error("UNSUPPORTED_DTYPE", "${type.name} unsupported for input", null)
+            }
         }
 
         // Prepare outputs
@@ -132,10 +142,10 @@ class FlutterNativeMlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             }
         }
 
-        // Resize if needed & allocate
+        // Resize if needed & allocate (note: this is a no-op for fixed shapes)
         for (i in 0 until interpreter.inputTensorCount) {
             val shape = interpreter.getInputTensor(i).shape()
-            interpreter.resizeInputTensor(i, shape)
+            interpreter.resizeInput(i, shape)
         }
         interpreter.allocateTensors()
 
@@ -155,7 +165,7 @@ class FlutterNativeMlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             }
         }
 
-        val accel = if (holder.nnApiDelegate != null) "NNAPI" else "CPU"
+        val accel = if (holder.gpuDelegate != null) "GPU" else "CPU"
         result.success(mapOf(
             "output" to finalOutput,
             "inferenceTime" to latency,
@@ -167,7 +177,7 @@ class FlutterNativeMlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         val modelId = call.argument<String>("modelId")!!
         loadedModels[modelId]?.let {
             it.interpreter.close()
-            it.nnApiDelegate?.close()
+            it.gpuDelegate?.close()
         }
         loadedModels.remove(modelId)
         result.success(null)
@@ -176,7 +186,7 @@ class FlutterNativeMlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
         loadedModels.values.forEach {
             it.interpreter.close()
-            it.nnApiDelegate?.close()
+            it.gpuDelegate?.close()
         }
         loadedModels.clear()
         channel.setMethodCallHandler(null)
