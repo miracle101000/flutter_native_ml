@@ -1,20 +1,27 @@
 name: flutter_native_ml
-description: A Flutter plugin that gives direct access to device-native machine learning accelerators like the Apple Neural Engine and Android NNAPI for blazing-fast on-device inference.
-version: 1.0.1
-homepage: https://github.com/miracle101000/flutter_native_ml 
+description: Direct access to on-device ML accelerators (Apple Neural Engine / Core ML on iOS, LiteRT GPU delegate, NNAPI and XNNPACK on Android) for fast native inference.
+version: 1.1.0
+homepage: https://github.com/miracle101000/flutter_native_ml
+repository: https://github.com/miracle101000/flutter_native_ml
+issue_tracker: https://github.com/miracle101000/flutter_native_ml/issues
 
 environment:
-  sdk: '>=2.18.0 <4.0.0'
-  flutter: '>=3.0.0'
+  sdk: '>=3.5.0 <4.0.0'
+  flutter: '>=3.24.0'
 
 dependencies:
   flutter:
     sdk: flutter
+  args: ^2.4.0
+  path: ^1.8.0
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  flutter_lints: ^2.0.1
+  flutter_lints: ^5.0.0
+
+executables:
+  ml_builder: ml_builder
 
 flutter:
   plugin:
@@ -22,6 +29,5 @@ flutter:
       android:
         package: com.example.flutter_native_ml
         pluginClass: FlutterNativeMlPlugin
-        kotlinPlugin: "yes"
       ios:
         pluginClass: FlutterNativeMlPlugin
