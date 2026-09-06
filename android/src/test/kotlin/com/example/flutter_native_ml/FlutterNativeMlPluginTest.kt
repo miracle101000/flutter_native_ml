@@ -55,6 +55,36 @@ internal class FlutterNativeMlPluginTest {
     }
 
     @Test
+    fun onMethodCall_cameraStartWithUnknownModel_reportsModelNotFound() {
+        val plugin = FlutterNativeMlPlugin()
+
+        val mockResult: MethodChannel.Result = Mockito.mock(MethodChannel.Result::class.java)
+        plugin.onMethodCall(MethodCall("cameraStart", mapOf("modelId" to "missing")), mockResult)
+
+        Mockito.verify(mockResult).error(Mockito.eq("MODEL_NOT_FOUND"), anyString(), isNull())
+    }
+
+    @Test
+    fun onMethodCall_cameraPauseWithUnknownSession_reportsSessionNotFound() {
+        val plugin = FlutterNativeMlPlugin()
+
+        val mockResult: MethodChannel.Result = Mockito.mock(MethodChannel.Result::class.java)
+        plugin.onMethodCall(MethodCall("cameraPause", mapOf("sessionId" to "missing")), mockResult)
+
+        Mockito.verify(mockResult).error(Mockito.eq("SESSION_NOT_FOUND"), anyString(), isNull())
+    }
+
+    @Test
+    fun onMethodCall_cameraStopWithUnknownSession_succeeds() {
+        val plugin = FlutterNativeMlPlugin()
+
+        val mockResult: MethodChannel.Result = Mockito.mock(MethodChannel.Result::class.java)
+        plugin.onMethodCall(MethodCall("cameraStop", mapOf("sessionId" to "missing")), mockResult)
+
+        Mockito.verify(mockResult).success(null)
+    }
+
+    @Test
     fun onMethodCall_streamInputBeforeLoad_reportsModelNotFound() {
         val plugin = FlutterNativeMlPlugin()
 

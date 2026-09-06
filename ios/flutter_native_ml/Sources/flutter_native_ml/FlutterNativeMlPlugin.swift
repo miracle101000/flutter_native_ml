@@ -1,3 +1,4 @@
+import AVFoundation
 import CoreGraphics
 import CoreML
 import CoreVideo
@@ -41,6 +42,9 @@ final class LoadedModel {
     var nextFrameId: Int64 = 0
     var processing = false
     var disposed = false
+
+    /// Camera sessions feeding this model (main thread only).
+    var cameraSessions: [String: CameraSession] = [:]
 
     init(id: String, model: MLModel, computeUnits: MLComputeUnits, acceleratorLabel: String, signature: [String: Any]) {
         self.id = id
@@ -89,6 +93,7 @@ public class FlutterNativeMlPlugin: NSObject, FlutterPlugin {
 
     private var registrar: FlutterPluginRegistrar?
     private var models: [String: LoadedModel] = [:]
+    private var cameraSessions: [String: CameraSession] = [:] // main thread only
     private let stateQueue = DispatchQueue(label: "flutter_native_ml.state")
     private let workQueue = DispatchQueue(label: "flutter_native_ml.work", qos: .userInitiated, attributes: .concurrent)
 
@@ -143,6 +148,25 @@ public class FlutterNativeMlPlugin: NSObject, FlutterPlugin {
         case "disposeAll":
             disposeAll()
             result(nil)
+        case "cameraCheckPermission":
+            result(cameraPermissionStatus())
+        case "cameraRequestPermission":
+            requestCameraPermission(result)
+        case "cameraStart":
+            reply(result) { try self.startCamera(args) }
+        case "cameraPause":
+            reply(result) {
+                try self.requireCameraSession(args).pause()
+                return nil
+            }
+        case "cameraResume":
+            reply(result) {
+                try self.requireCameraSession(args).resume()
+                return nil
+            }
+        case "cameraStop":
+            stopCamera(args["sessionId"] as? String)
+            result(nil)
         default:
             result(FlutterMethodNotImplemented)
         }
@@ -170,7 +194,7 @@ public class FlutterNativeMlPlugin: NSObject, FlutterPlugin {
         deliver(result, flutterError(from: error))
     }
 
-    private func flutterError(from error: Error) -> FlutterError {
+    func flutterError(from error: Error) -> FlutterError {
         if let native = error as? NativeMLError {
             return FlutterError(code: native.code, message: native.message, details: native.details)
         }
@@ -1044,7 +1068,7 @@ public class FlutterNativeMlPlugin: NSObject, FlutterPlugin {
 
     // MARK: Outputs
 
-    private func convertOutput(_ provider: MLFeatureProvider) -> ([String: Any], [String: Any]) {
+    func convertOutput(_ provider: MLFeatureProvider) -> ([String: Any], [String: Any]) {
         var output: [String: Any] = [:]
         var shapes: [String: Any] = [:]
         for name in provider.featureNames.sorted() {
@@ -1229,6 +1253,9 @@ public class FlutterNativeMlPlugin: NSObject, FlutterPlugin {
     }
 
     private func teardown(_ model: LoadedModel) {
+        for sessionId in Array(model.cameraSessions.keys) {
+            stopCamera(sessionId)
+        }
         stateQueue.sync {
             model.disposed = true
             model.streamActive = false
@@ -1255,6 +1282,203 @@ public class FlutterNativeMlPlugin: NSObject, FlutterPlugin {
         } else {
             DispatchQueue.main.async(execute: work)
         }
+    }
+
+    // MARK: - Camera
+
+    private func cameraPermissionStatus() -> String {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            return "granted"
+        case .denied:
+            return "denied"
+        case .restricted:
+            return "restricted"
+        case .notDetermined:
+            return "notDetermined"
+        @unknown default:
+            return "unknown"
+        }
+    }
+
+    private func requestCameraPermission(_ result: @escaping FlutterResult) {
+        guard Bundle.main.object(forInfoDictionaryKey: "NSCameraUsageDescription") != nil else {
+            fail(result, NativeMLError("MISSING_USAGE_DESCRIPTION", "Add NSCameraUsageDescription to your app's Info.plist before requesting camera access"))
+            return
+        }
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            result(true)
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { granted in
+                DispatchQueue.main.async { result(granted) }
+            }
+        default:
+            result(false)
+        }
+    }
+
+    private func parseCameraConfig(_ args: [String: Any]) -> CameraConfig {
+        let preprocessing = args["preprocessing"] as? [String: Any] ?? [:]
+        func floats(_ key: String) -> [Float]? {
+            let values = (preprocessing[key] as? [Any])?.compactMap { ($0 as? NSNumber)?.floatValue }
+            return (values?.isEmpty ?? true) ? nil : values
+        }
+        return CameraConfig(
+            lens: args["lens"] as? String ?? "back",
+            resolution: args["resolution"] as? String ?? "medium",
+            mean: floats("mean"),
+            std: floats("std"),
+            resizeMode: preprocessing["resizeMode"] as? String ?? "cover",
+            maxFps: (args["maxFps"] as? NSNumber)?.doubleValue,
+            preview: args["preview"] as? Bool ?? true
+        )
+    }
+
+    /// Chooses the model input that receives camera frames and describes its layout.
+    private func cameraInputSpec(model: LoadedModel, requestedName: String?) throws -> CameraInputSpec {
+        let inputs = model.model.modelDescription.inputDescriptionsByName
+        let required = inputs.values.filter { !$0.isOptional }
+        let description: MLFeatureDescription
+        if let name = requestedName {
+            guard let found = inputs[name] else {
+                throw NativeMLError("INPUT_MISMATCH", "No input named '\(name)'. Available inputs: \(inputs.keys.sorted())")
+            }
+            description = found
+        } else if required.count == 1, let only = required.first {
+            description = only
+        } else if let image = required.first(where: { $0.type == .image }) ?? required.first(where: { $0.type == .multiArray }) {
+            description = image
+        } else {
+            throw NativeMLError("INPUT_MISMATCH", "Could not find an image-like input; pass inputName to choose one of \(inputs.keys.sorted())")
+        }
+        if required.contains(where: { $0.name != description.name }) {
+            throw NativeMLError("MULTI_INPUT_UNSUPPORTED", "Camera input requires a model with a single required input; this model needs \(required.map { $0.name }.sorted())")
+        }
+
+        switch description.type {
+        case .image:
+            guard let constraint = description.imageConstraint else {
+                throw NativeMLError("UNSUPPORTED_INPUT", "Input '\(description.name)' has no image constraint")
+            }
+            return CameraInputSpec(
+                name: description.name,
+                kind: .image,
+                width: constraint.pixelsWide,
+                height: constraint.pixelsHigh,
+                channels: channelCount(forPixelFormat: constraint.pixelFormatType),
+                layout: .hwc,
+                dataType: .float32,
+                pixelFormat: constraint.pixelFormatType,
+                shape: []
+            )
+        case .multiArray:
+            guard let constraint = description.multiArrayConstraint else {
+                throw NativeMLError("UNSUPPORTED_INPUT", "Input '\(description.name)' has no multi-array constraint")
+            }
+            var shape = constraint.shape.map { $0.intValue }
+            if shape.contains(where: { $0 <= 0 }), let first = constraint.shapeConstraint.enumeratedShapes.first {
+                shape = first.map { $0.intValue }
+            }
+            var dims = shape
+            if dims.count == 4, dims[0] == 1 {
+                dims.removeFirst()
+            }
+            guard dims.count == 3, dims.allSatisfy({ $0 > 0 }) else {
+                throw NativeMLError("UNSUPPORTED_INPUT", "Camera input '\(description.name)' must be shaped [1, C, H, W] or [1, H, W, C]; got \(shape)")
+            }
+            let layout: CameraInputSpec.Layout
+            let width: Int
+            let height: Int
+            let channels: Int
+            if [1, 3, 4].contains(dims[0]) {
+                layout = .chw
+                channels = dims[0]
+                height = dims[1]
+                width = dims[2]
+            } else if [1, 3, 4].contains(dims[2]) {
+                layout = .hwc
+                height = dims[0]
+                width = dims[1]
+                channels = dims[2]
+            } else {
+                throw NativeMLError("UNSUPPORTED_INPUT", "Camera input '\(description.name)' must have 1, 3 or 4 channels; got shape \(shape)")
+            }
+            return CameraInputSpec(
+                name: description.name,
+                kind: .multiArray,
+                width: width,
+                height: height,
+                channels: channels,
+                layout: layout,
+                dataType: constraint.dataType,
+                pixelFormat: kCVPixelFormatType_32BGRA,
+                shape: shape
+            )
+        default:
+            throw NativeMLError("UNSUPPORTED_INPUT", "Camera input '\(description.name)' must be an image or multi-array feature")
+        }
+    }
+
+    /// Main thread.
+    private func startCamera(_ args: [String: Any]) throws -> [String: Any] {
+        let model = try requireModel(args)
+        guard let registrar = registrar else {
+            throw NativeMLError("NOT_ATTACHED", "Plugin is not attached to a Flutter engine")
+        }
+        guard cameraPermissionStatus() == "granted" else {
+            throw NativeMLError("PERMISSION_DENIED", "Camera permission has not been granted; call FlutterNativeML.requestCameraPermission() first")
+        }
+        let config = parseCameraConfig(args)
+        let spec = try cameraInputSpec(model: model, requestedName: args["inputName"] as? String)
+        let sessionId = UUID().uuidString
+        let session = CameraSession(
+            id: sessionId,
+            model: model,
+            input: spec,
+            config: config,
+            registrar: registrar,
+            convertOutput: { [unowned self] provider in self.convertOutput(provider) },
+            flutterError: { [unowned self] error in self.flutterError(from: error) }
+        )
+        do {
+            try session.start()
+        } catch {
+            session.stop()
+            throw error
+        }
+        cameraSessions[sessionId] = session
+        model.cameraSessions[sessionId] = session
+        return [
+            "sessionId": sessionId,
+            "textureId": session.textureId >= 0 ? session.textureId : NSNull(),
+            "previewWidth": session.previewWidth,
+            "previewHeight": session.previewHeight,
+            "previewRotationDegrees": 0,
+            "sensorOrientation": 0,
+            "lens": config.lens,
+            "inputName": spec.name,
+            "inputWidth": spec.width,
+            "inputHeight": spec.height,
+            "inputChannels": spec.channels,
+        ]
+    }
+
+    private func requireCameraSession(_ args: [String: Any]) throws -> CameraSession {
+        guard let sessionId = args["sessionId"] as? String else {
+            throw NativeMLError("INVALID_ARGS", "'sessionId' is required")
+        }
+        guard let session = cameraSessions[sessionId] else {
+            throw NativeMLError("SESSION_NOT_FOUND", "No camera session with id '\(sessionId)'")
+        }
+        return session
+    }
+
+    /// Main thread. Stopping an unknown session is not an error.
+    private func stopCamera(_ sessionId: String?) {
+        guard let sessionId = sessionId, let session = cameraSessions.removeValue(forKey: sessionId) else { return }
+        session.stop()
+        session.model.cameraSessions.removeValue(forKey: sessionId)
     }
 
     // MARK: - Capabilities
@@ -1288,6 +1512,7 @@ public class FlutterNativeMlPlugin: NSObject, FlutterPlugin {
             "neuralEngineAvailable": hasNeuralEngine,
             "neuralEngineHeuristic": true,
             "isEmulator": isSimulator,
+            "cameraAvailable": AVCaptureDevice.default(for: .video) != nil,
             "supportedComputeUnits": units,
         ]
     }

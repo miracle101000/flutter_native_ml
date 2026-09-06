@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/services.dart';
+import 'package:flutter_native_ml/src/camera.dart';
 import 'package:flutter_native_ml/src/exceptions.dart';
 import 'package:flutter_native_ml/src/models.dart';
 
@@ -64,6 +65,7 @@ class NativeMLModel {
   ModelSignature? _signature;
   bool _isDisposed = false;
 
+  final Set<NativeCameraSession> _cameraSessions = {};
   StreamController<InferenceResult>? _streamController;
   Stream<InferenceResult>? _stream;
   StreamSubscription<dynamic>? _eventSubscription;
@@ -85,6 +87,9 @@ class NativeMLModel {
 
   /// Whether [startStream] is active.
   bool get isStreaming => _streamController != null;
+
+  /// Camera sessions started with [startCamera] that have not been stopped.
+  List<NativeCameraSession> get cameraSessions => List.unmodifiable(_cameraSessions);
 
   /// Returns the model's inputs and outputs.
   ///
@@ -252,10 +257,59 @@ class NativeMLModel {
     await controller?.close();
   }
 
-  /// Releases the native model. Idempotent.
+  /// Opens the device camera and feeds every frame to this model natively.
+  ///
+  /// Frames are resized (see [CameraPreprocessing.resizeMode]) and converted
+  /// into the model's image input on the platform side; nothing but the
+  /// [NativeCameraSession.results] cross the platform channel.
+  ///
+  /// The model must have exactly one required image-like input: a Core ML
+  /// image input or a `uint8` / `int8` / `float32` tensor shaped
+  /// `[1, height, width, channels]` (LiteRT) or `[1, channels, height, width]`
+  /// (Core ML), with 1, 3 or 4 channels. [inputName] selects it when the model
+  /// has several inputs.
+  ///
+  /// Request camera permission first with
+  /// [FlutterNativeML.requestCameraPermission]. On iOS the app must declare
+  /// `NSCameraUsageDescription` in `Info.plist`.
+  ///
+  /// [maxFps] throttles inference (the preview keeps running at full rate).
+  /// Set [preview] to false when no on-screen preview is needed.
+  Future<NativeCameraSession> startCamera({
+    CameraLens lens = CameraLens.back,
+    CameraResolution resolution = CameraResolution.medium,
+    String? inputName,
+    CameraPreprocessing preprocessing = const CameraPreprocessing(),
+    double? maxFps,
+    bool preview = true,
+  }) async {
+    _ensureNotDisposed();
+    if (maxFps != null && maxFps <= 0) {
+      throw ArgumentError.value(maxFps, 'maxFps', 'must be positive');
+    }
+    final session = await NativeCameraSession.open(
+      _channel,
+      this,
+      lens: lens,
+      resolution: resolution,
+      inputName: inputName,
+      preprocessing: preprocessing,
+      maxFps: maxFps,
+      preview: preview,
+    );
+    _cameraSessions.add(session);
+    session.results.listen(null, onDone: () => _cameraSessions.remove(session));
+    return session;
+  }
+
+  /// Releases the native model. Idempotent. Also stops any camera session.
   Future<void> dispose() async {
     if (_isDisposed) return;
     _isDisposed = true;
+    for (final session in _cameraSessions.toList()) {
+      await session.stop();
+    }
+    _cameraSessions.clear();
     if (_streamController != null) {
       await _closeStream(notifyNative: false);
     }

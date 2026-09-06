@@ -4,7 +4,7 @@
 #
 Pod::Spec.new do |s|
   s.name             = 'flutter_native_ml'
-  s.version          = '1.1.0'
+  s.version          = '1.2.0'
   s.summary          = 'Direct access to Core ML (Neural Engine / GPU) for on-device inference in Flutter.'
   s.description      = <<-DESC
 A Flutter plugin that gives direct access to device-native machine learning

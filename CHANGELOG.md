@@ -1,3 +1,24 @@
+## 1.2.0
+
+### Added
+* **Zero-copy camera input.** `model.startCamera()` opens the device camera
+  natively (CameraX on Android, AVFoundation on iOS), resizes every frame into
+  the model's input on the model's own thread and streams only the results to
+  Dart. Includes a live preview texture (`NativeCameraPreview`), lens and
+  resolution selection, `cover` / `fill` / `contain` resizing, mean / std
+  normalisation presets, frame-rate throttling, pause / resume and automatic
+  stale-frame dropping.
+* `FlutterNativeML.checkCameraPermission()` / `requestCameraPermission()`.
+* `InferenceResult.frame` with the source frame size, rotation and timestamp.
+* `DeviceCapabilities.raw['cameraAvailable']`.
+
+### Changed
+* Android `minSdk` is now 23 (required by CameraX 1.5); the plugin declares the
+  `CAMERA` permission, which apps that never use the camera can strip with
+  `tools:node="remove"`.
+* iOS apps using the camera must declare `NSCameraUsageDescription`; the plugin
+  reports `MISSING_USAGE_DESCRIPTION` instead of crashing when it is absent.
+
 ## 1.1.0
 
 ### Fixed

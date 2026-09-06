@@ -101,6 +101,75 @@ void main() {
     }
   });
 
+  testWidgets('camera input feeds frames to the model natively', (tester) async {
+    final assetPath = candidateAssets.first;
+    if (!await _assetExists(assetPath)) {
+      debugPrint('SKIPPED: no model asset at $assetPath');
+      return;
+    }
+    final capabilities = await FlutterNativeML.getDeviceCapabilities();
+    final model = await FlutterNativeML.loadModel(assetPath: assetPath);
+    final status = await FlutterNativeML.checkCameraPermission();
+    debugPrint('camera permission: $status, cameraAvailable: ${capabilities.raw['cameraAvailable']}');
+
+    if (Platform.isIOS && capabilities.isEmulator) {
+      // The iOS simulator has no camera: the plugin must report it cleanly.
+      await expectLater(
+        model.startCamera(),
+        throwsA(isA<NativeMLException>().having((e) => e.code, 'code', anyOf('CAMERA_UNAVAILABLE', 'PERMISSION_DENIED'))),
+      );
+      await model.dispose();
+      return;
+    }
+    if (status != CameraPermissionStatus.granted) {
+      debugPrint('SKIPPED: camera permission not granted (grant it with adb before running)');
+      await model.dispose();
+      return;
+    }
+
+    final session = await model.startCamera(resolution: CameraResolution.low, maxFps: 10);
+    debugPrint('camera session: $session');
+    expect(session.inputWidth, greaterThan(0));
+    expect(session.inputHeight, greaterThan(0));
+    expect(session.textureId, isNotNull);
+    expect(session.previewWidth, greaterThan(0));
+    expect(model.cameraSessions, contains(session));
+
+    final received = <InferenceResult>[];
+    final errors = <Object>[];
+    final subscription = session.results.listen(received.add, onError: errors.add);
+    final deadline = DateTime.now().add(const Duration(seconds: 30));
+    while (received.length < 3 && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+    debugPrint('camera: ${received.length} results, first: ${received.isEmpty ? null : received.first}, frame: ${received.isEmpty ? null : received.first.frame}');
+    expect(errors, isEmpty);
+    expect(received.length, greaterThanOrEqualTo(3));
+    expect(received.first.frame, isNotNull);
+    expect(received.first.frame!.width, greaterThan(0));
+    expect(received.first.output, isNotEmpty);
+    final frameIds = received.map((r) => r.frameId!).toList();
+    expect(frameIds, orderedEquals(frameIds.toList()..sort()));
+
+    await session.pause();
+    final countAtPause = received.length;
+    await Future<void>.delayed(const Duration(milliseconds: 700));
+    expect(received.length, countAtPause, reason: 'no results while paused');
+    await session.resume();
+    final resumeDeadline = DateTime.now().add(const Duration(seconds: 15));
+    while (received.length == countAtPause && DateTime.now().isBefore(resumeDeadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+    expect(received.length, greaterThan(countAtPause), reason: 'results resume after resume()');
+
+    await session.stop();
+    expect(session.isRunning, isFalse);
+    expect(model.cameraSessions, isEmpty);
+    await subscription.cancel();
+    await session.stop(); // idempotent
+    await model.dispose();
+  });
+
   testWidgets('disposeAll succeeds', (tester) async {
     await FlutterNativeML.disposeAll();
   });
@@ -142,7 +211,7 @@ Future<void> _exerciseModel(String assetPath) async {
 
     // A second run returns the same output for the same input.
     final again = await model.run(input);
-    expect(again.output.keys, result.output.keys);
+    expect(again.output.keys, unorderedEquals(result.output.keys));
 
     // Error handling.
     await expectLater(
@@ -190,7 +259,7 @@ Future<void> _exerciseModel(String assetPath) async {
     final cpuModel = await FlutterNativeML.loadModel(assetPath: assetPath, computeUnits: ComputeUnit.cpuOnly);
     expect(cpuModel.acceleratorUsed, startsWith('CPU'));
     final cpuResult = await cpuModel.run(input);
-    expect(cpuResult.output.keys, result.output.keys);
+    expect(cpuResult.output.keys, unorderedEquals(result.output.keys));
     await cpuModel.dispose();
     await cpuModel.dispose();
 

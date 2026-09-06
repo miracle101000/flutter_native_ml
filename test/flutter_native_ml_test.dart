@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_native_ml/flutter_native_ml.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -355,6 +356,188 @@ void main() {
       await done.future;
       expect(model.isStreaming, isFalse);
       expect(calls.map((c) => c.method), ['startStream', 'dispose']);
+    });
+  });
+
+  group('camera', () {
+    const cameraChannel = EventChannel('flutter_native_ml_camera/cam1');
+    late StreamController<Object?> cameraEvents;
+
+    Map<String, dynamic> sessionMap() => {
+          'sessionId': 'cam1',
+          'textureId': 7,
+          'previewWidth': 1280,
+          'previewHeight': 720,
+          'previewRotationDegrees': 90,
+          'sensorOrientation': 90,
+          'lens': 'back',
+          'inputName': 'image',
+          'inputWidth': 224,
+          'inputHeight': 224,
+          'inputChannels': 3,
+        };
+
+    setUp(() {
+      cameraEvents = StreamController<Object?>.broadcast();
+      messenger.setMockStreamHandler(
+        cameraChannel,
+        MockStreamHandler.inline(
+          onListen: (arguments, events) {
+            expect(arguments, 'cam1');
+            cameraEvents.stream.listen(
+              events.success,
+              onError: (Object e) => events.error(code: 'INFERENCE_FAILED', message: '$e'),
+              onDone: events.endOfStream,
+            );
+          },
+        ),
+      );
+    });
+
+    tearDown(() async {
+      messenger.setMockStreamHandler(cameraChannel, null);
+      await cameraEvents.close();
+    });
+
+    test('permission helpers', () async {
+      mockHandler((call) async {
+        switch (call.method) {
+          case 'cameraCheckPermission':
+            return 'notDetermined';
+          case 'cameraRequestPermission':
+            return true;
+          default:
+            return null;
+        }
+      });
+      expect(await FlutterNativeML.checkCameraPermission(), CameraPermissionStatus.notDetermined);
+      expect(await FlutterNativeML.requestCameraPermission(), isTrue);
+      expect(CameraPermissionStatus.fromName('bogus'), CameraPermissionStatus.unknown);
+    });
+
+    test('startCamera sends the configuration and parses the session', () async {
+      mockHandler((call) async => call.method == 'cameraStart' ? sessionMap() : null);
+      final model = NativeMLModel.fromId('m1', channel);
+      final session = await model.startCamera(
+        lens: CameraLens.front,
+        resolution: CameraResolution.high,
+        inputName: 'image',
+        preprocessing: CameraPreprocessing.minusOneToOne,
+        maxFps: 15,
+        preview: true,
+      );
+
+      expect(calls.single.method, 'cameraStart');
+      expect(calls.single.arguments, {
+        'modelId': 'm1',
+        'lens': 'front',
+        'resolution': 'high',
+        'inputName': 'image',
+        'preprocessing': {
+          'mean': [127.5, 127.5, 127.5],
+          'std': [127.5, 127.5, 127.5],
+          'resizeMode': 'cover',
+        },
+        'maxFps': 15.0,
+        'preview': true,
+      });
+      expect(session.id, 'cam1');
+      expect(session.textureId, 7);
+      expect(session.previewRotationDegrees, 90);
+      expect(session.previewAspectRatio, closeTo(720 / 1280, 1e-9));
+      expect(session.inputWidth, 224);
+      expect(session.inputChannels, 3);
+      expect(session.lens, CameraLens.front);
+      expect(session.isRunning, isTrue);
+      expect(model.cameraSessions, [session]);
+      await session.stop();
+    });
+
+    test('delivers results with frame info, pauses, resumes and stops', () async {
+      mockHandler((call) async => call.method == 'cameraStart' ? sessionMap() : null);
+      final model = NativeMLModel.fromId('m1', channel);
+      final session = await model.startCamera();
+      final received = <InferenceResult>[];
+      final done = Completer<void>();
+      session.results.listen(received.add, onDone: done.complete);
+
+      cameraEvents.add({
+        'output': {'probs': Float32List.fromList([0.1, 0.9])},
+        'inferenceTime': 800.0,
+        'acceleratorUsed': 'GPU',
+        'frameId': 3,
+        'droppedFrames': 1,
+        'frame': {'width': 480, 'height': 640, 'rotationDegrees': 90, 'timestampMicros': 123456},
+      });
+      await pumpEventQueue();
+      expect(received.single.frameId, 3);
+      expect(received.single.frame?.width, 480);
+      expect(received.single.frame?.height, 640);
+      expect(received.single.frame?.rotationDegrees, 90);
+      expect(received.single.frame?.timestamp, const Duration(microseconds: 123456));
+      expect(received.single.argmax('probs'), 1);
+
+      await session.pause();
+      expect(session.isPaused, isTrue);
+      await session.resume();
+      expect(session.isPaused, isFalse);
+      await session.stop();
+      await session.stop();
+      await done.future;
+      expect(session.isRunning, isFalse);
+      expect(model.cameraSessions, isEmpty);
+      expect(calls.map((c) => c.method).toList(), ['cameraStart', 'cameraPause', 'cameraResume', 'cameraStop']);
+      expect(calls[1].arguments, {'sessionId': 'cam1'});
+      expect(() => session.pause(), throwsStateError);
+    });
+
+    test('disposing the model stops its camera sessions', () async {
+      mockHandler((call) async => call.method == 'cameraStart' ? sessionMap() : null);
+      final model = NativeMLModel.fromId('m1', channel);
+      final session = await model.startCamera(preview: false);
+      await model.dispose();
+      expect(session.isRunning, isFalse);
+      expect(calls.map((c) => c.method).toList(), ['cameraStart', 'cameraStop', 'dispose']);
+    });
+
+    test('a native start failure surfaces as NativeMLException', () async {
+      mockHandler((call) async {
+        throw PlatformException(code: 'CAMERA_UNAVAILABLE', message: 'no camera');
+      });
+      final model = NativeMLModel.fromId('m1', channel);
+      await expectLater(
+        model.startCamera(),
+        throwsA(isA<NativeMLException>().having((e) => e.code, 'code', 'CAMERA_UNAVAILABLE')),
+      );
+      expect(model.cameraSessions, isEmpty);
+      expect(() => model.startCamera(maxFps: 0), throwsArgumentError);
+    });
+
+    testWidgets('NativeCameraPreview rotates the texture upright', (tester) async {
+      final session = NativeCameraSession.forTesting(
+        id: 'cam1',
+        model: NativeMLModel.fromId('m1', channel),
+        textureId: 7,
+        previewWidth: 1280,
+        previewHeight: 720,
+        previewRotationDegrees: 90,
+      );
+      await tester.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: SizedBox(width: 300, height: 500, child: NativeCameraPreview(session: session)),
+        ),
+      );
+      final rotated = tester.widget<RotatedBox>(find.byType(RotatedBox));
+      expect(rotated.quarterTurns, 1);
+      expect(tester.widget<Texture>(find.byType(Texture)).textureId, 7);
+      expect(session.previewAspectRatio, closeTo(720 / 1280, 1e-9));
+    });
+
+    testWidgets('NativeCameraPreview without a texture renders nothing', (tester) async {
+      final session = NativeCameraSession.forTesting(id: 'cam2', model: NativeMLModel.fromId('m1', channel));
+      await tester.pumpWidget(NativeCameraPreview(session: session));
+      expect(find.byType(Texture), findsNothing);
     });
   });
 

@@ -1,5 +1,5 @@
 group = "com.example.flutter_native_ml"
-version = "1.1.0"
+version = "1.2.0"
 
 buildscript {
     val kotlinVersion = "2.1.0"
@@ -42,6 +42,10 @@ if (!usesBuiltInKotlin &&
 // `flutter_native_ml.litertVersion=<version>` in their gradle.properties.
 val litertVersion = (findProperty("flutter_native_ml.litertVersion") as? String) ?: "1.4.2"
 
+// CameraX powers the zero-copy camera input. 1.5.x matches Flutter's minimum
+// toolchain (AGP 8.6, compileSdk 35, minSdk 23).
+val cameraxVersion = (findProperty("flutter_native_ml.cameraxVersion") as? String) ?: "1.5.3"
+
 android {
     namespace = "com.example.flutter_native_ml"
 
@@ -62,8 +66,8 @@ android {
     }
 
     defaultConfig {
-        // LiteRT requires API 21+. Flutter itself requires a higher minSdk.
-        minSdk = 21
+        // CameraX 1.5 requires API 23 (LiteRT alone would work from 21).
+        minSdk = 23
     }
 
     testOptions {
@@ -95,6 +99,10 @@ dependencies {
     implementation("com.google.ai.edge.litert:litert-api:$litertVersion")
     implementation("com.google.ai.edge.litert:litert-gpu:$litertVersion")
     implementation("com.google.ai.edge.litert:litert-gpu-api:$litertVersion")
+
+    implementation("androidx.camera:camera-core:$cameraxVersion")
+    implementation("androidx.camera:camera-camera2:$cameraxVersion")
+    implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
 
     testImplementation("org.jetbrains.kotlin:kotlin-test")
     testImplementation("org.mockito:mockito-core:5.0.0")

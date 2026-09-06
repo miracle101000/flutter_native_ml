@@ -1,13 +1,20 @@
 package com.example.flutter_native_ml
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import androidx.lifecycle.LifecycleOwner
 import io.flutter.embedding.engine.plugins.FlutterPlugin
+import io.flutter.embedding.engine.plugins.activity.ActivityAware
+import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
+import io.flutter.embedding.engine.plugins.lifecycle.HiddenLifecycleReference
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import io.flutter.plugin.common.PluginRegistry
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.Tensor
@@ -47,7 +54,11 @@ internal class NativeMlException(
  *    delegate, whose OpenGL context is bound to the thread that created it.
  *  * Results are always delivered back to Flutter on the main thread.
  */
-class FlutterNativeMlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
+class FlutterNativeMlPlugin :
+    FlutterPlugin,
+    MethodChannel.MethodCallHandler,
+    ActivityAware,
+    PluginRegistry.RequestPermissionsResultListener {
 
     private companion object {
         const val TAG = "FlutterNativeML"
@@ -55,6 +66,23 @@ class FlutterNativeMlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         const val STREAM_CHANNEL_PREFIX = "flutter_native_ml_stream/"
         const val DEFAULT_MAX_QUEUE_SIZE = 2
         const val NNAPI_MIN_API = Build.VERSION_CODES.O_MR1
+        const val CAMERA_PERMISSION_REQUEST_CODE = 0x4D4C
+    }
+
+    /** Guarantees a [MethodChannel.Result] receives exactly one reply. */
+    private class OnceResult(private val inner: MethodChannel.Result) : MethodChannel.Result {
+        private val done = AtomicBoolean(false)
+        override fun success(result: Any?) {
+            if (done.compareAndSet(false, true)) inner.success(result)
+        }
+
+        override fun error(code: String, message: String?, details: Any?) {
+            if (done.compareAndSet(false, true)) inner.error(code, message, details)
+        }
+
+        override fun notImplemented() {
+            if (done.compareAndSet(false, true)) inner.notImplemented()
+        }
     }
 
     private enum class Accelerator(val label: String) { GPU("GPU"), NNAPI("NNAPI"), CPU("CPU") }
@@ -87,10 +115,16 @@ class FlutterNativeMlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         var droppedFrames = 0L
         val frameCounter = AtomicLong(0)
         val processing = AtomicBoolean(false)
+
+        /** Ids of camera sessions feeding this model (main thread only). */
+        val cameraSessionIds = mutableSetOf<String>()
     }
 
     private var channel: MethodChannel? = null
     private var binding: FlutterPlugin.FlutterPluginBinding? = null
+    private var activityBinding: ActivityPluginBinding? = null
+    private var pendingPermissionResult: MethodChannel.Result? = null
+    private val cameraSessions = ConcurrentHashMap<String, CameraSession>()
     private val mainHandler: Handler by lazy { Handler(Looper.getMainLooper()) }
     private val models = ConcurrentHashMap<String, ModelHolder>()
     private val sharedExecutor: ExecutorService by lazy {
@@ -113,6 +147,28 @@ class FlutterNativeMlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         channel?.setMethodCallHandler(null)
         channel = null
         this.binding = null
+    }
+
+    override fun onAttachedToActivity(binding: ActivityPluginBinding) {
+        activityBinding = binding
+        binding.addRequestPermissionsResultListener(this)
+    }
+
+    override fun onDetachedFromActivityForConfigChanges() {
+        activityBinding?.removeRequestPermissionsResultListener(this)
+        activityBinding = null
+    }
+
+    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
+        onAttachedToActivity(binding)
+    }
+
+    override fun onDetachedFromActivity() {
+        activityBinding?.removeRequestPermissionsResultListener(this)
+        activityBinding = null
+        pendingPermissionResult?.success(false)
+        pendingPermissionResult = null
+        stopAllCameras()
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -139,6 +195,21 @@ class FlutterNativeMlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     disposeAll()
                     result.success(null)
                 }
+                "cameraCheckPermission" -> result.success(cameraPermissionStatus())
+                "cameraRequestPermission" -> requestCameraPermission(result)
+                "cameraStart" -> startCamera(call, result)
+                "cameraPause" -> {
+                    requireCameraSession(call).pause()
+                    result.success(null)
+                }
+                "cameraResume" -> {
+                    requireCameraSession(call).resume()
+                    result.success(null)
+                }
+                "cameraStop" -> {
+                    stopCamera(call.argument<String>("sessionId"))
+                    result.success(null)
+                }
                 else -> result.notImplemented()
             }
         } catch (e: NativeMlException) {
@@ -161,6 +232,16 @@ class FlutterNativeMlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             return
         }
         mainHandler.post { result.success(outcome) }
+    }
+
+    /** Reports [error] to Flutter. Must be called on the main thread. */
+    private fun fail(result: MethodChannel.Result, error: Throwable) {
+        if (error is NativeMlException) {
+            result.error(error.code, error.message, error.details)
+        } else {
+            Log.e(TAG, "Native error", error)
+            result.error("NATIVE_ERROR", error.message ?: error.toString(), error.stackTraceToString())
+        }
     }
 
     private fun runShared(result: MethodChannel.Result, block: () -> Any?) {
@@ -501,7 +582,12 @@ class FlutterNativeMlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         if (needsAllocation) interpreter.allocateTensors()
 
         val inputs = Array<Any>(inputCount) { i -> toTensorData(interpreter.getInputTensor(i), pending[i]!!) }
+        return executeWithInputs(holder, inputs)
+    }
 
+    /** Runs the interpreter with already prepared inputs. Must be called on the model's executor thread. */
+    private fun executeWithInputs(holder: ModelHolder, inputs: Array<Any>): MutableMap<String, Any?> {
+        val interpreter = holder.interpreter
         val start = System.nanoTime()
         interpreter.runForMultipleInputsOutputs(inputs, HashMap<Int, Any>())
         val wallClockMicros = (System.nanoTime() - start) / 1_000.0
@@ -900,9 +986,10 @@ class FlutterNativeMlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         holder.executor.shutdown()
     }
 
-    /** Main-thread part of disposal: stop streaming and unregister the event channel. */
+    /** Main-thread part of disposal: stop cameras and streaming, unregister the event channel. */
     private fun teardown(holder: ModelHolder) {
         holder.disposed = true
+        holder.cameraSessionIds.toList().forEach { stopCamera(it) }
         synchronized(holder.streamLock) {
             holder.streamActive = false
             holder.queue.clear()
@@ -948,6 +1035,212 @@ class FlutterNativeMlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     }
 
     // ---------------------------------------------------------------------------------------------
+    // Camera
+    // ---------------------------------------------------------------------------------------------
+
+    private fun cameraPermissionStatus(): String {
+        val context = binding?.applicationContext
+            ?: throw NativeMlException("NOT_ATTACHED", "Plugin is not attached to a Flutter engine")
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return "granted"
+        val granted = context.checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        return if (granted) "granted" else "denied"
+    }
+
+    private fun requestCameraPermission(result: MethodChannel.Result) {
+        if (cameraPermissionStatus() == "granted") {
+            result.success(true)
+            return
+        }
+        val activity = activityBinding?.activity
+            ?: throw NativeMlException("NO_ACTIVITY", "Camera permission can only be requested while an Activity is attached")
+        if (pendingPermissionResult != null) {
+            throw NativeMlException("PERMISSION_REQUEST_IN_PROGRESS", "A camera permission request is already in progress")
+        }
+        pendingPermissionResult = result
+        activity.requestPermissions(arrayOf(Manifest.permission.CAMERA), CAMERA_PERMISSION_REQUEST_CODE)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray): Boolean {
+        if (requestCode != CAMERA_PERMISSION_REQUEST_CODE) return false
+        val result = pendingPermissionResult ?: return false
+        pendingPermissionResult = null
+        result.success(grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED)
+        return true
+    }
+
+    private fun resolveLifecycleOwner(): LifecycleOwner? {
+        val activityBinding = this.activityBinding ?: return null
+        (activityBinding.activity as? LifecycleOwner)?.let { return it }
+        val reference = activityBinding.lifecycle as? HiddenLifecycleReference ?: return null
+        return ProxyLifecycleOwner(reference.lifecycle)
+    }
+
+    private fun parseCameraConfig(call: MethodCall): CameraConfig {
+        val preprocessing = call.argument<Map<String, Any?>>("preprocessing") ?: emptyMap()
+        fun floats(key: String): FloatArray? =
+            (preprocessing[key] as? List<*>)?.mapNotNull { (it as? Number)?.toFloat() }?.toFloatArray()?.takeIf { it.isNotEmpty() }
+        return CameraConfig(
+            lens = call.argument<String>("lens") ?: "back",
+            resolution = call.argument<String>("resolution") ?: "medium",
+            mean = floats("mean"),
+            std = floats("std"),
+            resizeMode = preprocessing["resizeMode"] as? String ?: "cover",
+            maxFps = call.argument<Number>("maxFps")?.toDouble(),
+            preview = call.argument<Boolean>("preview") ?: true
+        )
+    }
+
+    /** Determines which input tensor receives camera frames. Must run on the model's executor. */
+    private fun cameraInputSpec(holder: ModelHolder, requestedName: String?): CameraInputSpec {
+        val interpreter = holder.interpreter
+        val count = interpreter.inputTensorCount
+        val index = when {
+            requestedName != null -> resolveInputIndex(interpreter, requestedName, null)
+            count == 1 -> 0
+            else -> (0 until count).firstOrNull { i ->
+                val shape = interpreter.getInputTensor(i).shape()
+                (shape.size == 4 || shape.size == 3) && shape.last() in intArrayOf(1, 3, 4)
+            } ?: throw NativeMlException(
+                "INPUT_MISMATCH",
+                "Could not find an image-like input; pass inputName to choose one of " +
+                    (0 until count).map { interpreter.getInputTensor(it).name() }
+            )
+        }
+        if (count > 1) {
+            throw NativeMlException(
+                "MULTI_INPUT_UNSUPPORTED",
+                "Camera input requires a model with a single input; this model has $count"
+            )
+        }
+        val tensor = interpreter.getInputTensor(index)
+        val shape = tensor.shape()
+        val dims = when {
+            shape.size == 4 && shape[0] == 1 -> shape.copyOfRange(1, 4)
+            shape.size == 3 -> shape
+            else -> throw NativeMlException(
+                "UNSUPPORTED_INPUT",
+                "Camera input '${tensor.name()}' must be shaped [1, height, width, channels] or [height, width, channels]; got ${shape.toList()}"
+            )
+        }
+        if (dims.any { it <= 0 }) {
+            throw NativeMlException("UNSUPPORTED_INPUT", "Camera input '${tensor.name()}' has dynamic dimensions ${shape.toList()}; use a fixed-shape model")
+        }
+        if (dims[2] !in intArrayOf(1, 3, 4)) {
+            throw NativeMlException("UNSUPPORTED_INPUT", "Camera input '${tensor.name()}' must have 1, 3 or 4 channels; got ${dims[2]}")
+        }
+        if (tensor.dataType() !in listOf(DataType.UINT8, DataType.INT8, DataType.FLOAT32)) {
+            throw NativeMlException("UNSUPPORTED_INPUT", "Camera input '${tensor.name()}' has type ${tensor.dataType()}; uint8, int8 or float32 required")
+        }
+        return CameraInputSpec(
+            name = tensor.name(),
+            index = index,
+            width = dims[1],
+            height = dims[0],
+            channels = dims[2],
+            dataType = tensor.dataType(),
+            numBytes = tensor.numBytes()
+        )
+    }
+
+    /** Main thread. */
+    private fun startCamera(call: MethodCall, rawResult: MethodChannel.Result) {
+        val result = OnceResult(rawResult)
+        val holder = requireModel(call)
+        val binding = this.binding
+            ?: throw NativeMlException("NOT_ATTACHED", "Plugin is not attached to a Flutter engine")
+        if (cameraPermissionStatus() != "granted") {
+            throw NativeMlException("PERMISSION_DENIED", "Camera permission has not been granted; call FlutterNativeML.requestCameraPermission() first")
+        }
+        val lifecycleOwner = resolveLifecycleOwner()
+            ?: throw NativeMlException("NO_ACTIVITY", "The camera needs a foreground Activity")
+        val config = parseCameraConfig(call)
+        val requestedInput = call.argument<String>("inputName")
+        val sessionId = UUID.randomUUID().toString()
+
+        holder.executor.execute {
+            val spec = try {
+                cameraInputSpec(holder, requestedInput)
+            } catch (t: Throwable) {
+                mainHandler.post { fail(result, t) }
+                return@execute
+            }
+            mainHandler.post {
+                if (holder.disposed) {
+                    fail(result, NativeMlException("MODEL_DISPOSED", "Model ${holder.id} has been disposed"))
+                    return@post
+                }
+                val session = CameraSession(
+                    id = sessionId,
+                    modelId = holder.id,
+                    context = binding.applicationContext,
+                    messenger = binding.binaryMessenger,
+                    textureRegistry = binding.textureRegistry,
+                    mainHandler = mainHandler,
+                    modelExecutor = holder.executor,
+                    input = spec,
+                    config = config
+                ) { buffer ->
+                    val inputs = Array<Any>(holder.interpreter.inputTensorCount) { buffer }
+                    executeWithInputs(holder, inputs)
+                }
+                cameraSessions[sessionId] = session
+                holder.cameraSessionIds += sessionId
+                try {
+                    session.start(
+                        lifecycleOwner,
+                        onReady = {
+                            result.success(
+                                mapOf(
+                                    "sessionId" to sessionId,
+                                    "textureId" to session.textureId,
+                                    "previewWidth" to session.previewWidth,
+                                    "previewHeight" to session.previewHeight,
+                                    "previewRotationDegrees" to session.previewRotationDegrees(),
+                                    "sensorOrientation" to session.sensorOrientation,
+                                    "lens" to config.lens,
+                                    "inputName" to spec.name,
+                                    "inputWidth" to spec.width,
+                                    "inputHeight" to spec.height,
+                                    "inputChannels" to spec.channels
+                                )
+                            )
+                        },
+                        onError = { t ->
+                            stopCamera(sessionId)
+                            fail(result, t)
+                        }
+                    )
+                } catch (t: Throwable) {
+                    stopCamera(sessionId)
+                    fail(result, t)
+                }
+            }
+        }
+    }
+
+    private fun requireCameraSession(call: MethodCall): CameraSession {
+        val sessionId = call.argument<String>("sessionId")
+            ?: throw NativeMlException("INVALID_ARGS", "'sessionId' is required")
+        return cameraSessions[sessionId]
+            ?: throw NativeMlException("SESSION_NOT_FOUND", "No camera session with id '$sessionId'")
+    }
+
+    /** Main thread. Stopping an unknown or already stopped session is not an error. */
+    private fun stopCamera(sessionId: String?) {
+        val session = sessionId?.let { cameraSessions.remove(it) } ?: return
+        try {
+            session.stop()
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to stop camera session", t)
+        }
+        models[session.modelId]?.cameraSessionIds?.remove(session.id)
+    }
+
+    private fun stopAllCameras() {
+        cameraSessions.keys.toList().forEach { stopCamera(it) }
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // Capabilities
     // ---------------------------------------------------------------------------------------------
 
@@ -959,6 +1252,11 @@ class FlutterNativeMlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             false
         }
         val nnapi = Build.VERSION.SDK_INT >= NNAPI_MIN_API
+        val cameraAvailable = try {
+            binding?.applicationContext?.packageManager?.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY) ?: false
+        } catch (t: Throwable) {
+            false
+        }
         val units = mutableListOf("all", "cpuOnly")
         if (gpu) units += "cpuAndGpu"
         if (nnapi) units += "cpuAndNeuralEngine"
@@ -973,6 +1271,7 @@ class FlutterNativeMlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             "nnapiAvailable" to nnapi,
             "neuralEngineAvailable" to false,
             "isEmulator" to isEmulator(),
+            "cameraAvailable" to cameraAvailable,
             "supportedComputeUnits" to units
         )
     }

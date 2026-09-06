@@ -20,10 +20,14 @@ library;
 import 'dart:async';
 
 import 'package:flutter/services.dart';
+import 'package:flutter_native_ml/src/camera.dart';
 import 'package:flutter_native_ml/src/exceptions.dart';
 import 'package:flutter_native_ml/src/models.dart';
 import 'package:flutter_native_ml/src/native_ml_model.dart';
 
+export 'package:flutter_native_ml/src/camera.dart'
+    show CameraLens, CameraResolution, ResizeMode, CameraPermissionStatus, CameraPreprocessing, NativeCameraSession;
+export 'package:flutter_native_ml/src/camera_preview.dart';
 export 'package:flutter_native_ml/src/exceptions.dart';
 export 'package:flutter_native_ml/src/models.dart';
 export 'package:flutter_native_ml/src/native_ml_model.dart' show NativeMLModel;
@@ -113,6 +117,22 @@ class FlutterNativeML {
   static Future<DeviceCapabilities> getDeviceCapabilities() async {
     final map = await invokeNative<Map<dynamic, dynamic>>(_methodChannel, 'getDeviceCapabilities');
     return DeviceCapabilities.fromMap(map ?? const {});
+  }
+
+  /// Whether the app may use the camera (see [NativeMLModel.startCamera]).
+  static Future<CameraPermissionStatus> checkCameraPermission() async {
+    final status = await invokeNative<String>(_methodChannel, 'cameraCheckPermission');
+    return CameraPermissionStatus.fromName(status);
+  }
+
+  /// Asks the user for camera permission. Returns true when granted.
+  ///
+  /// On iOS `NSCameraUsageDescription` must be present in `Info.plist`,
+  /// otherwise a `MISSING_USAGE_DESCRIPTION` error is thrown instead of
+  /// crashing the app.
+  static Future<bool> requestCameraPermission() async {
+    final granted = await invokeNative<bool>(_methodChannel, 'cameraRequestPermission');
+    return granted ?? false;
   }
 
   /// Releases every model loaded by this plugin. Useful after a hot restart

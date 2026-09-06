@@ -322,6 +322,39 @@ class ImageInput {
       };
 }
 
+/// Information about the camera frame an [InferenceResult] was computed from.
+class CameraFrameInfo {
+  /// Size of the upright source frame (after rotation), in pixels.
+  final int width;
+  final int height;
+
+  /// Rotation that was applied to make the frame upright.
+  final int rotationDegrees;
+
+  /// Capture timestamp on the device's monotonic clock.
+  final Duration? timestamp;
+
+  const CameraFrameInfo({
+    required this.width,
+    required this.height,
+    this.rotationDegrees = 0,
+    this.timestamp,
+  });
+
+  factory CameraFrameInfo.fromMap(Map<dynamic, dynamic> map) {
+    final micros = map['timestampMicros'];
+    return CameraFrameInfo(
+      width: (map['width'] as num?)?.toInt() ?? 0,
+      height: (map['height'] as num?)?.toInt() ?? 0,
+      rotationDegrees: (map['rotationDegrees'] as num?)?.toInt() ?? 0,
+      timestamp: micros is num ? Duration(microseconds: micros.round()) : null,
+    );
+  }
+
+  @override
+  String toString() => 'CameraFrameInfo(${width}x$height, rotation: $rotationDegrees°)';
+}
+
 /// The outcome of a single inference.
 class InferenceResult {
   /// Output values keyed by output name.
@@ -351,6 +384,9 @@ class InferenceResult {
   /// Frames dropped by the stream queue so far (streams only).
   final int droppedFrames;
 
+  /// The camera frame this result was computed from (camera sessions only).
+  final CameraFrameInfo? frame;
+
   const InferenceResult({
     required this.output,
     required this.inferenceTime,
@@ -359,6 +395,7 @@ class InferenceResult {
     this.nativeInferenceTime,
     this.frameId,
     this.droppedFrames = 0,
+    this.frame,
   });
 
   factory InferenceResult.fromMap(Map<dynamic, dynamic> map) {
@@ -377,6 +414,7 @@ class InferenceResult {
       acceleratorUsed: map['acceleratorUsed']?.toString() ?? 'unknown',
       frameId: (map['frameId'] as num?)?.toInt(),
       droppedFrames: (map['droppedFrames'] as num?)?.toInt() ?? 0,
+      frame: map['frame'] is Map ? CameraFrameInfo.fromMap(map['frame'] as Map) : null,
     );
   }
 

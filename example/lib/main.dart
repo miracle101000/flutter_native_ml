@@ -298,9 +298,18 @@ class _DemoPageState extends State<DemoPage> {
             child: Text(model?.isStreaming == true ? '4. Stop stream' : '4. Stream 10 frames'),
           ),
           const SizedBox(height: 8),
+          FilledButton.tonal(
+            onPressed: model != null && _signature != null && !_busy
+                ? () => Navigator.of(context).push(
+                      MaterialPageRoute<void>(builder: (_) => CameraPage(model: model)),
+                    )
+                : null,
+            child: const Text('5. Live camera (zero-copy)'),
+          ),
+          const SizedBox(height: 8),
           OutlinedButton(
             onPressed: model != null && !_busy ? _disposeModel : null,
-            child: const Text('5. Dispose model'),
+            child: const Text('6. Dispose model'),
           ),
           const SizedBox(height: 20),
           if (_result.isNotEmpty)
@@ -310,6 +319,148 @@ class _DemoPageState extends State<DemoPage> {
                 child: SelectableText(_result, style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
               ),
             ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Streams camera frames into [model] natively and overlays the live results.
+class CameraPage extends StatefulWidget {
+  final NativeMLModel model;
+
+  const CameraPage({super.key, required this.model});
+
+  @override
+  State<CameraPage> createState() => _CameraPageState();
+}
+
+class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
+  NativeCameraSession? _session;
+  StreamSubscription<InferenceResult>? _subscription;
+  InferenceResult? _latest;
+  String? _error;
+  CameraLens _lens = CameraLens.back;
+  int _results = 0;
+  DateTime? _windowStart;
+  double _fps = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _start();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _subscription?.cancel();
+    _session?.stop();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final session = _session;
+    if (session == null || !session.isRunning) return;
+    if (state == AppLifecycleState.resumed) {
+      session.resume();
+    } else if (state == AppLifecycleState.inactive || state == AppLifecycleState.paused) {
+      session.pause();
+    }
+  }
+
+  Future<void> _start() async {
+    try {
+      if (!await FlutterNativeML.requestCameraPermission()) {
+        setState(() => _error = 'Camera permission was not granted.');
+        return;
+      }
+      final session = await widget.model.startCamera(
+        lens: _lens,
+        preprocessing: CameraPreprocessing.zeroToOne,
+      );
+      _subscription = session.results.listen(
+        (result) {
+          _results++;
+          final now = DateTime.now();
+          final start = _windowStart ??= now;
+          final elapsed = now.difference(start).inMilliseconds;
+          if (elapsed >= 1000) {
+            _fps = _results * 1000 / elapsed;
+            _results = 0;
+            _windowStart = now;
+          }
+          if (mounted) setState(() => _latest = result);
+        },
+        onError: (Object e) {
+          if (mounted) setState(() => _error = '$e');
+        },
+      );
+      if (mounted) setState(() => _session = session);
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    }
+  }
+
+  Future<void> _switchLens() async {
+    await _subscription?.cancel();
+    await _session?.stop();
+    setState(() {
+      _session = null;
+      _latest = null;
+      _error = null;
+      _lens = _lens == CameraLens.back ? CameraLens.front : CameraLens.back;
+    });
+    await _start();
+  }
+
+  String _describe(InferenceResult result) {
+    final sb = StringBuffer()
+      ..writeln('${result.acceleratorUsed} · ${result.inferenceTime.inMilliseconds} ms · ${_fps.toStringAsFixed(1)} fps')
+      ..writeln('frame ${result.frameId} (${result.frame?.width}x${result.frame?.height}), dropped ${result.droppedFrames}');
+    for (final name in result.output.keys) {
+      final values = result.doubles(name);
+      if (values != null && values.isNotEmpty) {
+        final best = result.argmax(name)!;
+        sb.writeln('$name: argmax $best = ${values[best].toStringAsFixed(3)}');
+      } else {
+        sb.writeln('$name: ${result.output[name]}');
+      }
+    }
+    return sb.toString();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final session = _session;
+    final latest = _latest;
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Live camera'),
+        actions: [
+          IconButton(icon: const Icon(Icons.cameraswitch), onPressed: session == null ? null : _switchLens),
+        ],
+      ),
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          if (session != null) NativeCameraPreview(session: session) else const ColoredBox(color: Colors.black),
+          if (session == null && _error == null) const Center(child: CircularProgressIndicator()),
+          Positioned(
+            left: 12,
+            right: 12,
+            bottom: 12,
+            child: Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(8)),
+              child: Text(
+                _error ?? (latest == null ? 'Waiting for the first frame…' : _describe(latest)),
+                style: const TextStyle(color: Colors.white, fontFamily: 'monospace', fontSize: 12),
+              ),
+            ),
+          ),
         ],
       ),
     );

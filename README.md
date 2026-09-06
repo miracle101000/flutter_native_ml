@@ -30,6 +30,9 @@ tensors across the platform channel, as typed lists.
   parameters, optional inputs, SignatureDef aliases and metadata.
 - **🔁 Multi-input / multi-output** models, dynamic shapes and typed outputs
   (`Float32List`, `Int32List`, ...).
+- **📷 Zero-copy camera input**: the plugin runs the camera natively, resizes
+  every frame straight into the model's input on the model thread and streams
+  only the results to Dart, with a live preview texture.
 - **🎥 Streaming**: push frames into a bounded native queue and receive results
   on a `Stream`; stale frames are dropped automatically.
 - **🩺 Capabilities**: ask the device which accelerators it has before choosing
@@ -42,7 +45,7 @@ tensors across the platform channel, as typed lists.
 | Platform | Minimum                                       |
 |----------|-----------------------------------------------|
 | Flutter  | 3.24 (Dart 3.5)                               |
-| Android  | API 21 for the plugin (Flutter apps need 24+), AGP 8.6+, Java 17 |
+| Android  | API 23, AGP 8.6+, compileSdk 35+, Java 17          |
 | iOS      | 13.0, CocoaPods or Swift Package Manager      |
 
 ## 🔧 Setup & Usage
@@ -184,6 +187,51 @@ On Android inputs can also be addressed by their SignatureDef alias
 final model = await FlutterNativeML.loadModel(filePath: '/path/to/downloaded/model.tflite');
 ```
 
+## 📷 Zero-Copy Camera Input
+
+For live camera use cases let the plugin own the camera. Frames never enter
+Dart: CameraX (Android) / AVFoundation (iOS) hand each frame to the model's
+worker thread, which resizes it into the input tensor and runs inference. Only
+the results and a preview texture reach Flutter.
+
+```dart
+// Ask for permission once (iOS needs NSCameraUsageDescription in Info.plist).
+if (!await FlutterNativeML.requestCameraPermission()) return;
+
+final camera = await model.startCamera(
+  lens: CameraLens.back,
+  resolution: CameraResolution.medium,
+  preprocessing: CameraPreprocessing.zeroToOne, // mean / std / resize mode
+  maxFps: 15,                                   // optional throttle
+);
+
+// Live results, one per processed frame (stale frames are skipped).
+final sub = camera.results.listen((result) {
+  final best = result.argmax('probs');
+  print('frame ${result.frameId} (${result.frame?.width}x${result.frame?.height}): '
+        'class $best in ${result.inferenceTime.inMilliseconds} ms');
+});
+
+// Show the preview anywhere in your widget tree.
+NativeCameraPreview(session: camera, fit: BoxFit.cover);
+
+// Pause in the background, resume when the app returns, stop when done.
+await camera.pause();
+await camera.resume();
+await camera.stop();
+```
+
+The model needs one image-like input: a Core ML image input, or a `uint8` /
+`int8` / `float32` tensor shaped `[1, height, width, channels]` (LiteRT) or
+`[1, channels, height, width]` (Core ML) with 1, 3 or 4 channels. Use
+`inputName` for models with several inputs. `CameraPreprocessing` controls
+the resize mode (`cover`, `fill`, `contain`) and per-channel mean / std
+normalisation for float inputs (`zeroToOne`, `minusOneToOne`, `imagenet`
+presets); integer inputs receive raw 0-255 pixels.
+
+> Android apps that never use the camera can remove the permission the plugin
+> declares with `<uses-permission android:name="android.permission.CAMERA" tools:node="remove" />`.
+
 ## 🎥 Streaming Inference
 
 For camera or audio pipelines, keep a native queue busy instead of awaiting each
@@ -208,8 +256,8 @@ await subscription.cancel();
 ## 📝 Example App
 
 The `example/` app lets you load a model from the bundled assets or from a file
-path, pick a compute unit, inspect the signature, run inference and exercise
-the streaming API. Drop a `model.tflite` / `model.mlmodel` into
+path, pick a compute unit, inspect the signature, run inference, exercise the
+streaming API and run the zero-copy camera pipeline with a live preview. Drop a `model.tflite` / `model.mlmodel` into
 `example/assets/models/` to try it.
 
 ## 🧪 Testing
