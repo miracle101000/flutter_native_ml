@@ -9,6 +9,25 @@ learning runtimes: **Core ML** on iOS (Apple Neural Engine, GPU, CPU) and
 
 ---
 
+## 📖 Table of Contents
+
+- [Why It Matters](#-why-it-matters)
+- [Features](#-features)
+- [Requirements](#-requirements)
+- [Setup and Usage](#-setup-and-usage)
+  - [1. Add the dependency](#1-add-the-dependency)
+  - [2. Prepare your model](#2-prepare-your-model)
+  - [3. Declare the assets](#3-declare-the-assets)
+  - [4. Load, inspect, run, dispose](#4-load-inspect-run-dispose)
+  - [Choosing compute units](#choosing-compute-units)
+  - [Input formats](#input-formats)
+  - [Loading a model from the file system](#loading-a-model-from-the-file-system)
+- [Zero-Copy Camera Input](#-zero-copy-camera-input)
+- [Streaming Inference](#-streaming-inference)
+- [Example App](#-example-app)
+- [Testing](#-testing)
+- [Author](#-author)
+
 ## ✨ Why It Matters
 
 Running a TFLite interpreter from Dart keeps the hot path in the Dart VM and
@@ -48,7 +67,7 @@ tensors across the platform channel, as typed lists.
 | Android  | API 23, AGP 8.6+, compileSdk 35+, Java 17          |
 | iOS      | 13.0, CocoaPods or Swift Package Manager      |
 
-## 🔧 Setup & Usage
+## 🔧 Setup and Usage
 
 ### 1. Add the dependency
 

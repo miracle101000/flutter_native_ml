@@ -1,5 +1,5 @@
 group = "com.example.flutter_native_ml"
-version = "1.2.0"
+version = "1.2.1"
 
 buildscript {
     val kotlinVersion = "2.1.0"
