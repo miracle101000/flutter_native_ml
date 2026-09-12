@@ -21,6 +21,7 @@ learning runtimes: **Core ML** on iOS (Apple Neural Engine, GPU, CPU) and
   - [4. Load, inspect, run, dispose](#4-load-inspect-run-dispose)
   - [Choosing compute units](#choosing-compute-units)
   - [Input formats](#input-formats)
+  - [Android build notes](#android-build-notes)
   - [Loading a model from the file system](#loading-a-model-from-the-file-system)
 - [Zero-Copy Camera Input](#-zero-copy-camera-input)
 - [Streaming Inference](#-streaming-inference)
@@ -64,7 +65,7 @@ tensors across the platform channel, as typed lists.
 | Platform | Minimum                                       |
 |----------|-----------------------------------------------|
 | Flutter  | 3.24 (Dart 3.5)                               |
-| Android  | API 23, AGP 8.6+, compileSdk 35+, Java 17          |
+| Android  | API 23, AGP 8.6 – 9.x (built-in Kotlin supported), compileSdk 35+, Java 17 |
 | iOS      | 13.0, CocoaPods or Swift Package Manager      |
 
 ## 🔧 Setup and Usage
@@ -199,6 +200,24 @@ to see what the current device supports.
 
 On Android inputs can also be addressed by their SignatureDef alias
 (e.g. `input_1` instead of `serving_default_input_1:0`).
+
+### Android build notes
+
+The plugin follows Flutter's built-in Kotlin guidance: it does not apply the
+`org.jetbrains.kotlin.android` plugin when the Android Gradle Plugin provides
+Kotlin support itself, or when Flutter's tooling has already applied it, and
+it applies the plugin on its own only for older toolchains. Both of these
+`gradle.properties` setups are supported:
+
+```properties
+# Flutter 3.47+ (AGP 9 built-in Kotlin, the AGP 9 default)
+android.builtInKotlin=true
+android.newDsl=false
+
+# Flutter 3.35 – 3.46, or any app that has not migrated yet
+android.builtInKotlin=false
+android.newDsl=false
+```
 
 ### Loading a model from the file system
 

@@ -1,3 +1,19 @@
+## 1.2.2
+
+### Fixed
+* **Android: AGP 9 built-in Kotlin support.** With `android.builtInKotlin=true`
+  (the default since Android Gradle Plugin 9.0) the plugin previously tried to
+  apply the Kotlin Gradle plugin on top of AGP's own Kotlin support and the
+  build failed with `Cannot add extension with name 'kotlin'`. The plugin now
+  detects built-in Kotlin (and the AGP 9 new DSL) and only applies the Kotlin
+  Gradle plugin itself on older toolchains that need it. Enabling built-in
+  Kotlin in an app requires Flutter 3.47 or newer with `android.newDsl=false`
+  (Flutter's own Gradle tooling does not support the AGP 9 new DSL yet); apps
+  that keep `android.builtInKotlin=false` are unaffected.
+* Android unit tests: the test dependency is now `kotlin-test-junit5`
+  explicitly, because AGP's built-in Kotlin does not auto-select the JUnit 5
+  variant of the version-less `kotlin-test` shorthand.
+
 ## 1.2.1
 
 * README: added a table of contents and an author section. No code changes.

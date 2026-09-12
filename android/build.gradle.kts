@@ -1,5 +1,5 @@
 group = "com.example.flutter_native_ml"
-version = "1.2.1"
+version = "1.2.2"
 
 buildscript {
     val kotlinVersion = "2.1.0"
@@ -25,12 +25,17 @@ plugins {
     id("com.android.library")
 }
 
-// Flutter's Gradle plugin (3.35+) applies the Kotlin Gradle plugin to plugin
-// projects automatically (see "built-in Kotlin" in the Flutter docs). Older
-// Flutter versions do not, so apply it ourselves when it is missing and the
-// host project has not opted into AGP's built-in Kotlin support.
-val usesBuiltInKotlin = (findProperty("android.builtInKotlin") as? String)?.toBoolean() ?: false
-if (!usesBuiltInKotlin &&
+// Kotlin support, in order of preference:
+//  1. AGP 9+ built-in Kotlin (`android.builtInKotlin`, on by default since AGP 9):
+//     AGP registers the `kotlin` extension itself and applying the Kotlin Gradle
+//     plugin on top fails, so nothing to do.
+//  2. Flutter 3.35+ with built-in Kotlin disabled: Flutter's tooling applies the
+//     Kotlin Gradle plugin to plugin projects before this script runs.
+//  3. Older Flutter versions: apply the Kotlin Gradle plugin ourselves.
+val builtInKotlin = extensions.findByName("kotlin") != null ||
+    ((findProperty("android.builtInKotlin") as? String)?.toBoolean()
+        ?: (androidComponents.pluginVersion.major >= 9))
+if (!builtInKotlin &&
     !pluginManager.hasPlugin("org.jetbrains.kotlin.android") &&
     !pluginManager.hasPlugin("kotlin-android")
 ) {
@@ -88,8 +93,9 @@ android {
 }
 
 // Keep the Kotlin JVM target aligned with `compileOptions` above, regardless
-// of which JDK runs Gradle. Uses the task API so it works whether Kotlin was
-// applied by this script, by Flutter, or through AGP's built-in support.
+// of which JDK runs Gradle. Uses the task API (rather than the `kotlin {}`
+// extension, whose type-safe accessor only exists when the Kotlin plugin was
+// applied before this script) so it works for all three cases above.
 tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile::class.java).configureEach {
     compilerOptions.jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
 }
@@ -104,6 +110,9 @@ dependencies {
     implementation("androidx.camera:camera-camera2:$cameraxVersion")
     implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
 
-    testImplementation("org.jetbrains.kotlin:kotlin-test")
+    // Pinned and framework-specific on purpose: the version-less `kotlin-test`
+    // shorthand relies on the Kotlin Gradle plugin's test-framework
+    // auto-selection, which AGP's built-in Kotlin does not perform.
+    testImplementation("org.jetbrains.kotlin:kotlin-test-junit5:2.1.0")
     testImplementation("org.mockito:mockito-core:5.0.0")
 }
