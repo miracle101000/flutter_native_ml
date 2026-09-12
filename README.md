@@ -266,3 +266,7 @@ streaming API and run the zero-copy camera pipeline with a live preview. Drop a 
 flutter test                                   # Dart unit tests
 cd example/android && ./gradlew :flutter_native_ml:testDebugUnitTest   # Kotlin unit tests
 ```
+
+## 👤 Author
+
+**Miracle Okolo** · [LinkedIn](https://www.linkedin.com/in/miracle-okolo-bb2133183/) · [GitHub](https://github.com/miracle101000)
